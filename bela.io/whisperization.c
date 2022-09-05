@@ -18,12 +18,13 @@ The Bela software is distributed under the GNU Lesser General Public License
 */
 
 #include <Bela.h>
-#include <ne10/NE10.h>                    // NEON FFT library
-#include <Midi.h>
+#include <libraries/ne10/NE10.h>
+//#include <libraries/Midi/Midi.h>
 #include <math.h>
 #include <stdio.h>
 #include <time.h>
 #include <stdlib.h>
+#include <string.h>
 
 #define BUFFER_SIZE (16384)
 
@@ -44,6 +45,7 @@ int Hs = gFFTSize/8;   /* synthisis hopsize */
 int gHopSize = Hs;
 int gPeriod = gHopSize;
 float modWhisp = 0.f; // 0...1, where 0 means no whisperization and 1 full whisperization
+float prevModWhisp = 0.f; 
 
 float gFFTScaleFactor = 0;
 float *gInputAudio = NULL;
@@ -70,6 +72,14 @@ AuxiliaryTask gFFTTask;
 int gFFTInputBufferPointer = 0;
 int gFFTOutputBufferPointer = 0;
 
+// cpu cycle read
+static inline uint32_t ccnt_read (void)
+{
+  uint32_t cc = 0;
+  __asm__ volatile ("mrc p15, 0, %0, c9, c13, 0":"=r" (cc));
+  return cc;
+}
+
 // instantiate the scope
 //Scope scope;
 
@@ -91,7 +101,7 @@ bool setup(BelaContext* context, void* userData)
         return false;
     }
 
-    gFFTScaleFactor = 1.0f / (float)gFFTSize;
+    gFFTScaleFactor = (float)Hs / (float)gFFTSize;
     gOutputBufferWritePointer = Hs;
     gOutputBufferReadPointer = 0;
 
@@ -150,6 +160,11 @@ bool setup(BelaContext* context, void* userData)
 // This function handles the FFT based whisperization
 void process_whisperization(float *inBuffer, int inWritePointer, float *outBuffer, int outWritePointer)
 {
+
+    uint32_t t0 = ccnt_read();
+    uint32_t t1 = t0;//ccnt_read();       
+    //rt_printf("%u\n", t1-t0);
+
     // Copy buffer into FFT input
     int pointer = (inWritePointer - gFFTSize + BUFFER_SIZE) % BUFFER_SIZE;
     for(int n = 0; n < gFFTSize; n++) {
@@ -170,26 +185,27 @@ void process_whisperization(float *inBuffer, int inWritePointer, float *outBuffe
         float randVal = (float)rand()/(float)RAND_MAX;
         //printf("randVal = %f\n",randVal);
         phi[n] = modWhisp*(2.f*M_PI*randVal) + (1.f-modWhisp)*phi[n];
+
     }
     
     for(int n = 0; n < gFFTSize; n++) {
-        frequencyDomain[n].r = cosf(psi[n]) * amplitude[n];
-        frequencyDomain[n].i = sinf(psi[n]) * amplitude[n];
+        frequencyDomain[n].r = cosf(phi[n]) /** (1+modWhisp)*/ * amplitude[n];
+        frequencyDomain[n].i = sinf(phi[n]) /** (1+modWhisp)*/ * amplitude[n];
     }
 
     ne10_fft_c2c_1d_float32_neon (timeDomainOut, frequencyDomain, cfg, 1);
     
     for(int n = 0; n < gFFTSize; n++)
     {
-        timeDomainOut[n].r = timeDomainOut[n].r * gWindowBuffer[n];
+        timeDomainOut[n].r = gFFTScaleFactor * timeDomainOut[n].r * gWindowBuffer[n];
     }
 
     // Overlap-and-add timeDomainOut into the output buffer
     pointer = outWritePointer;
     int n;
-    for(n = 0; n < (1<<gFFTSize); n++)
+    for(n = 0; n < gFFTSize; n++)
     {
-        outBuffer[pointer] += (int16_t)((float)timeDomainIn[n].r);
+        outBuffer[pointer] += timeDomainOut[n].r;
         
         //if(isnan(outBuffer[pointer]))
         //    rt_printf("outBuffer OLA\n");
@@ -198,6 +214,10 @@ void process_whisperization(float *inBuffer, int inWritePointer, float *outBuffe
         if(pointer >= BUFFER_SIZE)
             pointer = 0;
     }
+
+    t1 = ccnt_read();
+    rt_printf("\rmodWhisp = %f ####  %u cycles process", modWhisp, t1-t0);
+
 }
 
 // Function to process the FFT in a thread at lower priority
@@ -210,9 +230,24 @@ void render(BelaContext *context, void *userData)
     // iterate over the audio frames and create three oscillators, seperated in phase by PI/2
     for(unsigned int n = 0; n < context->audioFrames; n++) {
         if(gAudioFramesPerAnalogFrame && !(n % gAudioFramesPerAnalogFrame)) {
-            // read analog inputs and update modPhase value
-            modPhase = (int)floor(map(analogRead(context, n/gAudioFramesPerAnalogFrame, gAnalogIn), 0, 1, -180, 180));
-            //modPhase = 0;
+            if(n==0)
+            {
+                // read analog inputs and update modWhisp value
+                modWhisp = (float)floor(map(analogRead(context, n/gAudioFramesPerAnalogFrame, gAnalogIn), 0, 1, 0, 110))/100.f;
+#if 1
+                if(modWhisp >= prevModWhisp+0.1f)
+                {
+                    prevModWhisp += 0.1f;
+                }
+                else if(modWhisp <= prevModWhisp-0.1f)
+                {
+                    prevModWhisp -= 0.1f;
+                }
+
+                modWhisp = prevModWhisp;
+#endif
+
+            }
         }
 
         // Read audio inputs
